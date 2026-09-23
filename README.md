@@ -1,7 +1,6 @@
-# Stream PostgreSQL Changes to S3 Using Fargate and EventBridge
+# How to stream PostgreSQL changes to Amazon S3 with AWS Fargate
 
-This repository contains the code and infrastructure template for the AWS Database Blog post:
-**"How to stream Amazon RDS for PostgreSQL and Amazon Aurora PostgreSQL changes to Amazon S3 using AWS Fargate and Amazon EventBridge"**
+This repository contains the code and infrastructure template for the AWS Database Blog post "How to stream PostgreSQL changes to Amazon S3 with AWS Fargate."
 
 ## Architecture
 
@@ -9,7 +8,7 @@ This repository contains the code and infrastructure template for the AWS Databa
 RDS/Aurora PostgreSQL → Fargate CDC Reader → EventBridge → SQS → Lambda → S3
 ```
 
-The pipeline captures row-level changes (INSERT, UPDATE, DELETE) from a PostgreSQL database using logical replication and delivers enriched JSON records to S3 in near real time.
+The pipeline captures row-level changes (INSERT, UPDATE, DELETE) from a PostgreSQL database using logical replication and writes them as JSON records to S3 in near real time.
 
 ## Repository structure
 
