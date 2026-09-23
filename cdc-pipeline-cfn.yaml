@@ -1,0 +1,552 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CDC Pipeline: Streams row-level changes from Amazon RDS for PostgreSQL or
+  Amazon Aurora PostgreSQL to Amazon S3 using Fargate, EventBridge, SQS, and Lambda.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC where your RDS instance lives.
+  Subnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: First subnet (must be in a different AZ than Subnet2).
+  Subnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second subnet (must be in a different AZ than Subnet1).
+  SourceDBEndpoint:
+    Type: String
+    Description: The endpoint of your source RDS or Aurora PostgreSQL instance.
+  SourceDBPort:
+    Type: Number
+    Default: 5432
+    Description: The port your PostgreSQL instance listens on.
+  SourceDBName:
+    Type: String
+    Default: postgres
+    Description: The database name to connect to.
+  SourceDBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: The security group attached to your source database instance.
+  CreateVpcEndpoints:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Set to true if your subnets are private and need VPC endpoints to reach
+      AWS services. Set to false if your subnets have internet access.
+
+Conditions:
+  ShouldCreateVpcEndpoints: !Equals [!Ref CreateVpcEndpoints, 'true']
+
+Resources:
+
+  # ============================================================
+  # S3 Bucket
+  # ============================================================
+  CDCBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cdc-pipeline-output-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  CDCBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CDCBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSLAccess
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CDCBucket.Arn
+              - !Sub '${CDCBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ============================================================
+  # Security Groups
+  # ============================================================
+  CDCPipelineSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for CDC pipeline components (Fargate, Lambda, VPC Endpoints)
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: cdc-pipeline-sg
+
+  CDCPipelineSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref CDCPipelineSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref CDCPipelineSecurityGroup
+
+  SourceDBIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SourceDBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref CDCPipelineSecurityGroup
+
+  # ============================================================
+  # VPC Endpoints (conditional - only for private subnets)
+  # ============================================================
+  SQSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sqs'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      SecurityGroupIds:
+        - !Ref CDCPipelineSecurityGroup
+
+  EventBridgeEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.events'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      SecurityGroupIds:
+        - !Ref CDCPipelineSecurityGroup
+
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      SecurityGroupIds:
+        - !Ref CDCPipelineSecurityGroup
+
+  ECRApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      SecurityGroupIds:
+        - !Ref CDCPipelineSecurityGroup
+
+  ECRDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      SecurityGroupIds:
+        - !Ref CDCPipelineSecurityGroup
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      SecurityGroupIds:
+        - !Ref CDCPipelineSecurityGroup
+
+  # S3 Gateway Endpoint (required for Lambda to write to S3 and ECR image layer pulls)
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+
+  # ============================================================
+  # SQS Queue with Dead Letter Queue
+  # ============================================================
+  CDCDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: cdc-pipeline-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+      SqsManagedSseEnabled: true
+
+  CDCQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: cdc-pipeline-queue
+      VisibilityTimeout: 360  # 6x Lambda timeout (60s)
+      MessageRetentionPeriod: 345600  # 4 days
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CDCDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  CDCQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref CDCQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeSend
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt CDCQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt CDCEventRule.Arn
+
+  # ============================================================
+  # EventBridge
+  # ============================================================
+  CDCEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: cdc-pipeline-bus
+
+  CDCEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: cdc-pipeline-rule
+      EventBusName: !Ref CDCEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - cdc.postgres
+        detail-type:
+          - CDC Change Event
+      Targets:
+        - Arn: !GetAtt CDCQueue.Arn
+          Id: CDCQueueTarget
+
+  # ============================================================
+  # Lambda Consumer
+  # ============================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cdc-lambda-consumer-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cdc-lambda-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SQSAccess
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt CDCQueue.Arn
+              - Sid: S3WriteAccess
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${CDCBucket.Arn}/*'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Sid: VPCAccess
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                Resource: '*'
+
+  CDCLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cdc-pipeline-consumer
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref CDCPipelineSecurityGroup
+        SubnetIds:
+          - !Ref Subnet1
+          - !Ref Subnet2
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref CDCBucket
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import hashlib
+          from datetime import datetime, timezone
+
+          s3 = boto3.client('s3')
+          BUCKET = os.environ['S3_BUCKET']
+
+          def handler(event, context):
+              for record in event['Records']:
+                  body = json.loads(record['body'])
+                  detail = body.get('detail', body)
+
+                  operation = detail.get('operation', 'UNKNOWN')
+                  table = detail.get('table', 'unknown')
+                  data = detail.get('data', {})
+                  lsn = detail.get('lsn', 'unknown')
+                  slot = detail.get('slot', 'unknown')
+
+                  if isinstance(data, dict):
+                      data_for_id = json.dumps(data)
+                      record_id = data.get('id', hashlib.md5(data_for_id.encode()).hexdigest()[:8])
+                  else:
+                      data_for_id = str(data)
+                      record_id = hashlib.md5(data_for_id.encode()).hexdigest()[:8]
+
+                  api_response = {
+                      "status": "success",
+                      "external_id": f"EXT-{record_id}",
+                      "processed_at": datetime.now(timezone.utc).isoformat()
+                  }
+
+                  enriched = {
+                      "original_db_record": data,
+                      "api_response": api_response,
+                      "cdc_metadata": {
+                          "operation": operation,
+                          "table": table,
+                          "lsn": lsn,
+                          "slot": slot
+                      }
+                  }
+
+                  now = datetime.now(timezone.utc)
+                  s3_key = (
+                      f"year={now.year}/month={now.month:02d}/day={now.day:02d}/"
+                      f"{table}_{record_id}_{now.strftime('%H%M%S')}.json"
+                  )
+
+                  s3.put_object(
+                      Bucket=BUCKET,
+                      Key=s3_key,
+                      Body=json.dumps(enriched, default=str),
+                      ContentType='application/json'
+                  )
+
+                  print(f"Processed {operation} on {table}, saved to s3://{BUCKET}/{s3_key}")
+
+              return {'statusCode': 200, 'processed': len(event['Records'])}
+
+  LambdaSQSMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt CDCQueue.Arn
+      FunctionName: !Ref CDCLambdaFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 30
+      Enabled: true
+
+  # ============================================================
+  # ECS Fargate - CDC Reader
+  # ============================================================
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: cdc-pipeline-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  CDCReaderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/cdc-reader
+      RetentionInDays: 14
+
+  FargateTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cdc-fargate-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: secrets-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cdc-pipeline/db-credentials-*'
+
+  FargateTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cdc-fargate-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cdc-reader-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EventBridgePutEvents
+                Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt CDCEventBus.Arn
+
+  CDCReaderECRRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: cdc-reader
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+
+  CDCReaderTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: cdc-reader
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt FargateTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt FargateTaskRole.Arn
+      ContainerDefinitions:
+        - Name: cdc-reader
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/cdc-reader:latest'
+          Essential: true
+          Environment:
+            - Name: DB_HOST
+              Value: !Ref SourceDBEndpoint
+            - Name: DB_PORT
+              Value: !Ref SourceDBPort
+            - Name: DB_NAME
+              Value: !Ref SourceDBName
+            - Name: REPLICATION_SLOT
+              Value: cdc_pipeline_slot
+            - Name: PUBLICATION_NAME
+              Value: cdc_pipeline_pub
+            - Name: EVENT_BUS_NAME
+              Value: !Ref CDCEventBus
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+          Secrets:
+            - Name: DB_USER
+              ValueFrom: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cdc-pipeline/db-credentials:username::'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cdc-pipeline/db-credentials:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CDCReaderLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: cdc-reader
+
+  CDCReaderService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: cdc-reader-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref CDCReaderTaskDefinition
+      DesiredCount: 0
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref Subnet1
+            - !Ref Subnet2
+          SecurityGroups:
+            - !Ref CDCPipelineSecurityGroup
+
+Outputs:
+  S3BucketName:
+    Value: !Ref CDCBucket
+    Description: S3 bucket for CDC output
+  SQSQueueURL:
+    Value: !Ref CDCQueue
+    Description: SQS queue URL
+  EventBusName:
+    Value: !Ref CDCEventBus
+    Description: EventBridge bus name
+  LambdaFunctionName:
+    Value: !Ref CDCLambdaFunction
+    Description: Lambda consumer function name
+  ECSClusterName:
+    Value: !Ref ECSCluster
+    Description: ECS cluster name
+  ECRRepoURI:
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/cdc-reader'
+    Description: ECR repository URI for the CDC reader image
